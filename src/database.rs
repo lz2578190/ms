@@ -67,7 +67,11 @@ impl Database {
     }
 
     async fn create_tables(&self) -> ResultType<()> {
-        sqlx::query!(
+        use std::ops::DerefMut;
+        let conn = self.pool.get().await?.deref_mut();
+    
+        // peer 表
+        sqlx::query(
             r#"
             create table if not exists peer (
                 guid blob primary key not null,
@@ -80,24 +84,40 @@ impl Database {
                 note varchar(300),
                 info text not null
             ) without rowid;
-            create unique index if not exists index_peer_id on peer (id);
-            create index if not exists index_peer_user on peer (user);
-            create index if not exists index_peer_created_at on peer (created_at);
-            create index if not exists index_peer_status on peer (status);
-
-            -- 控制端白名单缓存（允许发起连接的控制端 Peer ID）
-            create table if not exists license_bind (
-                id   varchar(100) primary key,         -- 控制端 Peer ID（无空格）
-                note varchar(300),
-                created_at integer not null default (cast(strftime('%s','now') as integer)*1000)
-            ) without rowid;
-            create index if not exists index_license_bind_id on license_bind (id);
-            "#
+            "#,
         )
-        .execute(self.pool.get().await?.deref_mut())
+        .execute(conn)
         .await?;
+    
+        sqlx::query("create unique index if not exists index_peer_id on peer (id)")
+            .execute(conn).await?;
+        sqlx::query("create index if not exists index_peer_user on peer (user)")
+            .execute(conn).await?;
+        sqlx::query("create index if not exists index_peer_created_at on peer (created_at)")
+            .execute(conn).await?;
+        sqlx::query("create index if not exists index_peer_status on peer (status)")
+            .execute(conn).await?;
+    
+        // ===========================
+        // 如需“保留 license_bind”，取消下面注释；如果走 JWT 直通，请删除这段
+        // ===========================
+        sqlx::query(
+            r#"
+            create table if not exists license_bind (
+                id   varchar(100) primary key,
+                note varchar(300),
+                created_at integer not null
+            ) without rowid;
+            "#,
+        )
+        .execute(conn)
+        .await?;
+        sqlx::query("create index if not exists index_license_bind_id on license_bind (id)")
+            .execute(conn).await?;
+    
         Ok(())
     }
+
 
     pub async fn get_peer(&self, id: &str) -> ResultType<Option<Peer>> {
         Ok(sqlx::query_as!(
