@@ -56,9 +56,6 @@ pub struct Peer {
     pub status: Option<i64>,
 }
 
-use std::ops::DerefMut;
-use sqlx::{self, Sqlite, SqlitePool, Executor}; // 视你现有 use 而定
-// 其他 use 按你项目保持不变…
 
 impl Database {
     pub async fn new(url: &str) -> ResultType<Database> {
