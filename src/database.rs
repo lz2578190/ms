@@ -1,13 +1,14 @@
 use async_trait::async_trait;
 use hbb_common::{log, ResultType};
-use std::ops::DerefMut;
+// use std::ops::DerefMut;
 // use sqlx::{
 //     sqlite::SqliteConnectOptions, ConnectOptions, Connection, Error as SqlxError, SqliteConnection,
 // };
 use sqlx::{
-    self,
     sqlite::SqliteConnectOptions,
     ConnectOptions,
+	Connection,
+	Row,
     SqliteConnection,
     Executor,
     Error as SqlxError,
@@ -81,13 +82,12 @@ impl Database {
 
     // ✅ 修正版：使用事务 + 运行期校验（query()），并正确持有连接的 guard
     async fn create_tables(&self) -> ResultType<()> {
-        let mut guard = self.pool.get().await?;         // 持有连接 guard
-        let conn = guard.deref_mut();                   // &mut SqliteConnection
-        let mut tx = conn.begin().await?;               // 一个事务里建表 + 索引
-
-        // peer 表
-        sqlx::query(
-            r#"
+        let mut guard = self.pool.get().await?;    // 拿到连接 guard
+        let conn = guard.deref_mut();              // &mut SqliteConnection
+        let mut tx = conn.begin().await?;          // 放事务里
+    
+        // 1) peer 表（保持你原有结构）
+        sqlx::query(r#"
             create table if not exists peer (
                 guid blob primary key not null,
                 id varchar(100) not null,
@@ -99,9 +99,8 @@ impl Database {
                 note varchar(300),
                 info text not null
             ) without rowid;
-            "#
-        ).execute(&mut *tx).await?;
-
+        "#).execute(&mut *tx).await?;
+    
         sqlx::query("create unique index if not exists index_peer_id on peer (id)")
             .execute(&mut *tx).await?;
         sqlx::query("create index if not exists index_peer_user on peer (user)")
@@ -110,21 +109,19 @@ impl Database {
             .execute(&mut *tx).await?;
         sqlx::query("create index if not exists index_peer_status on peer (status)")
             .execute(&mut *tx).await?;
-
-        // ✅ 保留 license_bind （注意：created_at 用 integer 存毫秒时间戳）
-        sqlx::query(
-            r#"
+    
+        // 2) 新增：license_bind（控制端白名单）
+        // 如果暂时不想本地白名单，整段删掉，同时也删 CRUD（见下一节）
+        sqlx::query(r#"
             create table if not exists license_bind (
                 id   varchar(100) primary key,
                 note varchar(300),
                 created_at integer not null
             ) without rowid;
-            "#
-        ).execute(&mut *tx).await?;
-
+        "#).execute(&mut *tx).await?;
         sqlx::query("create index if not exists index_license_bind_id on license_bind (id)")
             .execute(&mut *tx).await?;
-
+    
         tx.commit().await?;
         Ok(())
     }
