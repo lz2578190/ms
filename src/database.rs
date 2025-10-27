@@ -1,9 +1,20 @@
 use async_trait::async_trait;
 use hbb_common::{log, ResultType};
+use std::ops::DerefMut;
+// use sqlx::{
+//     sqlite::SqliteConnectOptions, ConnectOptions, Connection, Error as SqlxError, SqliteConnection,
+// };
 use sqlx::{
-    sqlite::SqliteConnectOptions, ConnectOptions, Connection, Error as SqlxError, SqliteConnection,
+    self,
+    sqlite::SqliteConnectOptions,
+    ConnectOptions,
+    SqliteConnection,
+    Executor,
+    Error as SqlxError,
 };
 use std::{ops::DerefMut, str::FromStr};
+
+
 
 type Pool = deadpool::managed::Pool<DbPool>;
 
