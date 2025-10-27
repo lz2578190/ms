@@ -1,13 +1,13 @@
 use async_trait::async_trait;
 use hbb_common::{log, ResultType};
 
-use sqlx::{Executor, Row, Error as SqlxError};
+use sqlx::{Row, Error as SqlxError};
 use sqlx::sqlite::SqliteConnectOptions;
 use sqlx::SqliteConnection;
-use sqlx::ConnectOptions;
+use sqlx::{ConnectOptions, Connection}; // 重要：把 Connection trait 引入作用域
 
 use std::{ops::DerefMut, str::FromStr, result::Result as StdResult};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::UNIX_EPOCH;
 
 fn now_ms() -> i64 {
     UNIX_EPOCH.elapsed().unwrap_or_default().as_millis() as i64
@@ -26,11 +26,13 @@ impl deadpool::managed::Manager for DbPool {
 
     async fn create(&self) -> StdResult<SqliteConnection, SqlxError> {
         let mut opt = SqliteConnectOptions::from_str(&self.url).unwrap();
-        opt.log_statements(log::LevelFilter::Debug); // 按需保留日志
+        opt.log_statements(log::LevelFilter::Debug); // 按需保留/关闭 SQL 日志
+        // 需要 Connection trait 在作用域内
         SqliteConnection::connect_with(&opt).await
     }
 
     async fn recycle(&self, obj: &mut SqliteConnection) -> deadpool::managed::RecycleResult<SqlxError> {
+        // 需要 Connection trait 在作用域内
         Ok(obj.ping().await?)
     }
 }
@@ -75,7 +77,7 @@ impl Database {
     async fn create_tables(&self) -> ResultType<()> {
         let mut guard = self.pool.get().await?; // guard 持有连接
         let conn = guard.deref_mut();           // &mut SqliteConnection
-        let mut tx = conn.begin().await?;       // 事务
+        let mut tx = conn.begin().await?;       // 事务（需要 Connection trait 在作用域）
 
         // 1) peer
         sqlx::query(r#"
@@ -197,7 +199,12 @@ impl Database {
     // license_bind（控制端白名单）
     // -------------------------
 
-    /// 业务侧“缓存允控端 ID”（你测试里调用的是这个名字）
+    /// 兼容旧调用名（rendezvous_server.rs 调用的是这个）
+    pub async fn license_bind_insert(&self, id: &str, note: &str) -> ResultType<()> {
+        self.upsert_license_bind(id, note, now_ms()).await
+    }
+
+    /// 业务侧“缓存允控端 ID”（你测试里也用了这个名字）
     pub async fn cache_license_bind(&self, id: &str, note: &str) -> ResultType<()> {
         self.upsert_license_bind(id, note, now_ms()).await
     }
