@@ -7,7 +7,11 @@ use sqlx::SqliteConnection;
 use sqlx::ConnectOptions;
 
 use std::{ops::DerefMut, str::FromStr, result::Result as StdResult};
-use chrono::Utc;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+fn now_ms() -> i64 {
+    UNIX_EPOCH.elapsed().unwrap_or_default().as_millis() as i64
+}
 
 type Pool = deadpool::managed::Pool<DbPool>;
 
@@ -22,8 +26,7 @@ impl deadpool::managed::Manager for DbPool {
 
     async fn create(&self) -> StdResult<SqliteConnection, SqlxError> {
         let mut opt = SqliteConnectOptions::from_str(&self.url).unwrap();
-        // 打开 SQL 打印（可按需关掉）
-        opt.log_statements(log::LevelFilter::Debug);
+        opt.log_statements(log::LevelFilter::Debug); // 按需保留日志
         SqliteConnection::connect_with(&opt).await
     }
 
@@ -59,25 +62,22 @@ impl Database {
             .unwrap_or(1);
         log::debug!("MAX_DATABASE_CONNECTIONS={}", n);
 
-        let pool = Pool::new(
-            DbPool { url: url.to_owned() },
-            n,
-        );
+        let pool = Pool::new(DbPool { url: url.to_owned() }, n);
 
-        // test connection
+        // 连通性测试
         let _ = pool.get().await?;
         let db = Database { pool };
         db.create_tables().await?;
         Ok(db)
     }
 
-    /// 初始化表结构（事务 + 运行期执行）
+    /// 运行期建表（事务），避免编译期宏校验依赖已有表
     async fn create_tables(&self) -> ResultType<()> {
-        let mut guard = self.pool.get().await?;       // guard 持有连接
-        let conn = guard.deref_mut();                 // &mut SqliteConnection
-        let mut tx = conn.begin().await?;             // 开事务
+        let mut guard = self.pool.get().await?; // guard 持有连接
+        let conn = guard.deref_mut();           // &mut SqliteConnection
+        let mut tx = conn.begin().await?;       // 事务
 
-        // 1) peer 表
+        // 1) peer
         sqlx::query(r#"
             create table if not exists peer (
                 guid blob primary key not null,
@@ -101,7 +101,7 @@ impl Database {
         sqlx::query("create index if not exists index_peer_status on peer (status)")
             .execute(&mut *tx).await?;
 
-        // 2) license_bind（控制端 ID 白名单）
+        // 2) license_bind（控制端白名单）
         sqlx::query(r#"
             create table if not exists license_bind (
                 id   varchar(100) primary key,
@@ -118,7 +118,7 @@ impl Database {
     }
 
     // -------------------------
-    // peer 相关（与原工程兼容）
+    // peer 相关（与原工程接口对齐）
     // -------------------------
 
     pub async fn get_peer(&self, id: &str) -> ResultType<Option<Peer>> {
@@ -134,13 +134,13 @@ impl Database {
 
         if let Some(row) = row_opt {
             let peer = Peer {
-                guid:  row.get::<Vec<u8>, _>("guid"),
-                id:    row.get::<String, _>("id"),
-                uuid:  row.get::<Vec<u8>, _>("uuid"),
-                pk:    row.get::<Vec<u8>, _>("pk"),
-                user:  row.try_get::<Option<Vec<u8>>, _>("user").unwrap_or(None),
-                status:row.try_get::<Option<i64>, _>("status").unwrap_or(None),
-                info:  row.get::<String, _>("info"),
+                guid:   row.get::<Vec<u8>, _>("guid"),
+                id:     row.get::<String, _>("id"),
+                uuid:   row.get::<Vec<u8>, _>("uuid"),
+                pk:     row.get::<Vec<u8>, _>("pk"),
+                user:   row.try_get::<Option<Vec<u8>>, _>("user").unwrap_or(None),
+                status: row.try_get::<Option<i64>, _>("status").unwrap_or(None),
+                info:   row.get::<String, _>("info"),
             };
             Ok(Some(peer))
         } else {
@@ -160,16 +160,14 @@ impl Database {
         let mut guard = self.pool.get().await?;
         let conn = guard.deref_mut();
 
-        sqlx::query(
-            "insert into peer(guid, id, uuid, pk, info) values(?, ?, ?, ?, ?)"
-        )
-        .bind(&guid)
-        .bind(id)
-        .bind(uuid)
-        .bind(pk)
-        .bind(info)
-        .execute(&mut *conn)
-        .await?;
+        sqlx::query("insert into peer(guid, id, uuid, pk, info) values(?, ?, ?, ?, ?)")
+            .bind(&guid)
+            .bind(id)
+            .bind(uuid)
+            .bind(pk)
+            .bind(info)
+            .execute(&mut *conn)
+            .await?;
 
         Ok(guid)
     }
@@ -184,79 +182,71 @@ impl Database {
         let mut guard = self.pool.get().await?;
         let conn = guard.deref_mut();
 
-        sqlx::query(
-            "update peer set id = ?, pk = ?, info = ? where guid = ?"
-        )
-        .bind(id)
-        .bind(pk)
-        .bind(info)
-        .bind(guid)
-        .execute(&mut *conn)
-        .await?;
+        sqlx::query("update peer set id = ?, pk = ?, info = ? where guid = ?")
+            .bind(id)
+            .bind(pk)
+            .bind(info)
+            .bind(guid)
+            .execute(&mut *conn)
+            .await?;
 
         Ok(())
     }
 
     // -------------------------
-    // license_bind（白名单）
+    // license_bind（控制端白名单）
     // -------------------------
 
-    /// 供业务层“缓存允控端 ID”的便捷方法（你测试里调用了这个名字）
+    /// 业务侧“缓存允控端 ID”（你测试里调用的是这个名字）
     pub async fn cache_license_bind(&self, id: &str, note: &str) -> ResultType<()> {
-        let now_ms = Utc::now().timestamp_millis();
-        self.upsert_license_bind(id, note, now_ms).await
+        self.upsert_license_bind(id, note, now_ms()).await
     }
 
-    /// 供业务层判断“控制端是否允许”：
-    /// - 存在记录且未过期（now - created_at <= ttl_ms）→ true
-    /// - 否则 false
+    /// 判断控制端是否允许：存在且未过期（now - created_at <= ttl_ms）
     pub async fn is_controller_allowed(&self, id: &str, ttl_ms: i64) -> ResultType<bool> {
         if let Some(created_at) = self.get_license_bind_created_at(id).await? {
-            let now_ms = Utc::now().timestamp_millis();
-            return Ok(now_ms - created_at <= ttl_ms);
+            return Ok(now_ms() - created_at <= ttl_ms);
         }
         Ok(false)
     }
 
-    /// upsert（内部用）
-    pub async fn upsert_license_bind(&self, id: &str, note: &str, now_ms: i64) -> ResultType<()> {
+    /// upsert
+    pub async fn upsert_license_bind(&self, id: &str, note: &str, created_at_ms: i64) -> ResultType<()> {
         let mut guard = self.pool.get().await?;
         let conn = guard.deref_mut();
 
-        sqlx::query(
-            r#"
+        sqlx::query(r#"
             insert into license_bind(id, note, created_at)
             values(?, ?, ?)
             on conflict(id) do update set
                 note = excluded.note,
                 created_at = excluded.created_at
-            "#
-        )
+        "#)
         .bind(id)
         .bind(note)
-        .bind(now_ms)
+        .bind(created_at_ms)
         .execute(&mut *conn)
         .await?;
 
         Ok(())
     }
 
-    /// 取 created_at（内部用）
+    /// 读取 created_at
     pub async fn get_license_bind_created_at(&self, id: &str) -> ResultType<Option<i64>> {
         let mut guard = self.pool.get().await?;
         let conn = guard.deref_mut();
 
-        let row = sqlx::query_scalar::<_, i64>(
+        let ts_opt = sqlx::query_scalar::<_, i64>(
             "select created_at from license_bind where id = ? limit 1"
         )
         .bind(id)
         .fetch_optional(&mut *conn)
         .await?;
 
-        Ok(row)
+        Ok(ts_opt)
     }
 
-    /// 是否存在（有些地方喜欢直接判断存在性）
+    /// 是否存在
     pub async fn license_bind_exists(&self, id: &str) -> ResultType<bool> {
         let mut guard = self.pool.get().await?;
         let conn = guard.deref_mut();
@@ -271,7 +261,7 @@ impl Database {
         Ok(cnt > 0)
     }
 
-    /// 删除（可选）
+    /// 删除
     pub async fn delete_license_bind(&self, id: &str) -> ResultType<()> {
         let mut guard = self.pool.get().await?;
         let conn = guard.deref_mut();
@@ -284,7 +274,7 @@ impl Database {
         Ok(())
     }
 
-    /// 兼容其它调用名
+    /// 兼容其它地方的命名
     pub async fn is_id_whitelisted(&self, id: &str) -> ResultType<bool> {
         self.license_bind_exists(id).await
     }
