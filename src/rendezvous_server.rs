@@ -1,5 +1,7 @@
 use crate::common::*;
 use crate::peer::*;
+use crate::database::Database; // ← 新增：数据库（白名单）访问
+
 use hbb_common::{
     allow_err, bail,
     bytes::{Bytes, BytesMut},
@@ -39,6 +41,10 @@ use std::{
     sync::Arc,
     time::Instant,
 };
+
+// 远端授权回查所需
+use reqwest::Client;
+use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug)]
 enum Data {
@@ -80,6 +86,7 @@ pub struct RendezvousServer {
     relay_servers0: Arc<RelayServers>,
     rendezvous_servers: Arc<Vec<String>>,
     inner: Arc<Inner>,
+    db: Database, // ← 新增：本地白名单数据库
 }
 
 enum LoopFailure {
@@ -119,6 +126,12 @@ impl RendezvousServer {
                     .unwrap_or_default(),
             )
         };
+
+        // ← 新增：初始化数据库（白名单）
+        let db_path = std::env::var("HBBS_DB").unwrap_or_else(|_| "hbbs.sqlite3".to_string());
+        let db = Database::new(&db_path).await?;
+        log::info!("HBBS_DB = {}", db_path);
+
         let mut rs = Self {
             tcp_punch: Arc::new(Mutex::new(HashMap::new())),
             pm,
@@ -134,6 +147,7 @@ impl RendezvousServer {
                 mask,
                 local_ip,
             }),
+            db, // ← 新增
         };
         log::info!("mask: {:?}", rs.inner.mask);
         log::info!("local-ip: {:?}", rs.inner.local_ip);
@@ -670,6 +684,95 @@ impl RendezvousServer {
         Ok(())
     }
 
+    // ===== 授权相关辅助 =====
+
+    /// 从连接地址反查出控制端(发起方) Peer ID
+    async fn resolve_controller_id(&self, addr: SocketAddr) -> Option<String> {
+        // 你的 PeerMap 里若有其他更直接的方法，可替换此处
+        if let Some(id) = self.pm.get_id_by_addr(addr).await {
+            return Some(id.replace(' ', ""));
+        }
+        None
+    }
+
+    /// 远端只读校验（如果设置了 LICENSE_CHECK_URL）
+    async fn license_check_remote(&self, controller_id: &str) -> ResultType<bool> {
+        // let url = match std::env::var("LICENSE_CHECK_URL") {
+        //     Ok(s) if !s.is_empty() => s,
+        //     _ => return Ok(false), // 未配置视为不启用远端校验
+        // };
+		let url = "http://43.208.146.149/license_api.php?action=check".to_string();
+
+        #[derive(Serialize)]
+        struct Req<'a> {
+            controller_id: &'a str,
+        }
+        #[derive(Deserialize)]
+        struct Resp {
+            ok: bool,
+        }
+
+        let client = Client::new();
+        let resp = client
+            .post(&url)
+            .json(&Req { controller_id })
+            .send()
+            .await;
+
+        match resp {
+            Ok(r) if r.status().is_success() => {
+                let v = r.json::<Resp>().await.unwrap_or(Resp { ok: false });
+                Ok(v.ok)
+            }
+            Ok(r) => {
+                log::warn!("[license-check] http {}", r.status());
+                Ok(false)
+            }
+            Err(e) => {
+                log::warn!("[license-check] error {}", e);
+                Ok(false)
+            }
+        }
+    }
+
+    /// 远端通过后是否回填本地白名单
+    // fn allow_remote_then_fill_local() -> bool {
+    //     matches!(
+    //         std::env::var("LICENSE_FILL_LOCAL_AFTER_REMOTE_OK")
+    //             .map(|v| v == "1")
+    //             .ok(),
+    //         Some(true)
+    //     )
+    // }
+	fn allow_remote_then_fill_local() -> bool { true }
+
+
+    /// 授权拦截：在真正打洞前对控制端做授权判断
+    async fn enforce_controller_license(&self, addr: SocketAddr) -> ResultType<bool> {
+        let Some(controller_id) = self.resolve_controller_id(addr).await else {
+            return Ok(false);
+        };
+
+        // 1) 本地白名单
+        if self.db.is_id_whitelisted(&controller_id).await? {
+            return Ok(true);
+        }
+
+        // 2) 远端只读校验（可选）
+        if self.license_check_remote(&controller_id).await? {
+            if Self::allow_remote_then_fill_local() {
+                let _ = self
+                    .db
+                    .license_bind_insert(&controller_id, "remote-verified")
+                    .await;
+            }
+            return Ok(true);
+        }
+
+        // 3) 最终失败
+        Ok(false)
+    }
+
     #[inline]
     async fn handle_punch_hole_request(
         &mut self,
@@ -679,6 +782,8 @@ impl RendezvousServer {
         ws: bool,
     ) -> ResultType<(RendezvousMessage, Option<SocketAddr>)> {
         let mut ph = ph;
+
+        // 旧的 license key 校验（若你仍在用）
         if !key.is_empty() && ph.licence_key != key {
             let mut msg_out = RendezvousMessage::new();
             msg_out.set_punch_hole_response(PunchHoleResponse {
@@ -687,12 +792,19 @@ impl RendezvousServer {
             });
             return Ok((msg_out, None));
         }
+
+        // 新增：控制端授权拦截（本地白名单 + 远端只读校验）
+        if !self.enforce_controller_license(addr).await? {
+            let mut msg_out = RendezvousMessage::new();
+            msg_out.set_punch_hole_response(PunchHoleResponse {
+                failure: punch_hole_response::Failure::LICENSE_MISMATCH.into(),
+                ..Default::default()
+            });
+            return Ok((msg_out, None));
+        }
+
+        // ===== 原有逻辑保持不变 =====
         let id = ph.id;
-        // punch hole request from A, relay to B,
-        // check if in same intranet first,
-        // fetch local addrs if in same intranet.
-        // because punch hole won't work if in the same intranet,
-        // all routers will drop such self-connections.
         if let Some(peer) = self.pm.get(&id).await {
             let (elapsed, peer_addr) = {
                 let r = peer.read().await;
@@ -727,24 +839,14 @@ impl RendezvousServer {
                 });
             let socket_addr = AddrMangle::encode(addr).into();
             if same_intranet {
-                log::debug!(
-                    "Fetch local addr {:?} {:?} request from {:?}",
-                    id,
-                    peer_addr,
-                    addr
-                );
+                log::debug!("Fetch local addr {:?} {:?} request from {:?}", id, peer_addr, addr);
                 msg_out.set_fetch_local_addr(FetchLocalAddr {
                     socket_addr,
                     relay_server,
                     ..Default::default()
                 });
             } else {
-                log::debug!(
-                    "Punch hole {:?} {:?} request from {:?}",
-                    id,
-                    peer_addr,
-                    addr
-                );
+                log::debug!("Punch hole {:?} {:?} request from {:?}", id, peer_addr, addr);
                 msg_out.set_punch_hole(PunchHole {
                     socket_addr,
                     nat_type: ph.nat_type,

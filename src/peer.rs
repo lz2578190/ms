@@ -88,6 +88,18 @@ impl PeerMap {
         };
         Ok(pm)
     }
+	
+	 /// （PunchHole 时来源端口可能变化，所以仅比对 IP；如果你希望更严格，可在注册时额外记“最近一次握手”）
+	pub(crate) async fn get_id_by_addr(&self, addr: &SocketAddr) -> Option<String> {
+		let map = self.map.read().await;
+		for (id, lp) in map.iter() {
+			let p = lp.read().await;
+			if p.socket_addr.ip() == addr.ip() {
+				return Some(id.clone());
+			}
+		}
+		None
+	}
 
     #[inline]
     pub(crate) async fn update_pk(

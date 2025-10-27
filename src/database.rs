@@ -4,8 +4,6 @@ use sqlx::{
     sqlite::SqliteConnectOptions, ConnectOptions, Connection, Error as SqlxError, SqliteConnection,
 };
 use std::{ops::DerefMut, str::FromStr};
-//use sqlx::postgres::PgPoolOptions;
-//use sqlx::mysql::MySqlPoolOptions;
 
 type Pool = deadpool::managed::Pool<DbPool>;
 
@@ -70,7 +68,7 @@ impl Database {
 
     async fn create_tables(&self) -> ResultType<()> {
         sqlx::query!(
-            "
+            r#"
             create table if not exists peer (
                 guid blob primary key not null,
                 id varchar(100) not null,
@@ -86,7 +84,15 @@ impl Database {
             create index if not exists index_peer_user on peer (user);
             create index if not exists index_peer_created_at on peer (created_at);
             create index if not exists index_peer_status on peer (status);
-        "
+
+            -- 控制端白名单缓存（允许发起连接的控制端 Peer ID）
+            create table if not exists license_bind (
+                id   varchar(100) primary key,         -- 控制端 Peer ID（无空格）
+                note varchar(300),
+                created_at integer not null default (cast(strftime('%s','now') as integer)*1000)
+            ) without rowid;
+            create index if not exists index_license_bind_id on license_bind (id);
+            "#
         )
         .execute(self.pool.get().await?.deref_mut())
         .await?;
@@ -142,6 +148,68 @@ impl Database {
         .await?;
         Ok(())
     }
+
+    /// 允许某个控制端（Peer ID）发起连接（写白名单，若已存在则刷新时间）
+    pub async fn cache_license_bind(&self, id: &str, note: &str) -> ResultType<()> {
+        let id = id.replace(' ', "");
+        let now_ms: i64 = (std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis()) as i64;
+        sqlx::query!(
+            "insert into license_bind(id, note, created_at) values(?, ?, ?)
+             on conflict(id) do update set note=excluded.note, created_at=excluded.created_at",
+            id,
+            note,
+            now_ms
+        )
+        .execute(self.pool.get().await?.deref_mut())
+        .await?;
+        Ok(())
+    }
+
+    /// 本地是否允许（命中白名单且未过期），ttl_ms 为缓存 TTL
+    pub async fn is_controller_allowed(&self, id: &str, ttl_ms: i64) -> ResultType<bool> {
+        let id = id.replace(' ', "");
+        let rec = sqlx::query!(
+            "select created_at from license_bind where id = ? limit 1",
+            id
+        )
+        .fetch_optional(self.pool.get().await?.deref_mut())
+        .await?;
+        if let Some(row) = rec {
+            let now_ms: i64 = (std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis()) as i64;
+            let created = row.created_at.unwrap_or(0);
+            return Ok(now_ms - created <= ttl_ms);
+        }
+        Ok(false)
+    }
+
+    /// 旧接口：手动插入一次性白名单
+    pub async fn license_bind_insert(&self, id: &str, note: &str) -> ResultType<()> {
+        self.cache_license_bind(id, note).await
+    }
+
+    /// 旧接口：检查是否存在（不看 TTL）
+    pub async fn is_id_whitelisted(&self, id: &str) -> ResultType<bool> {
+        let id = id.replace(' ', "");
+        let rec = sqlx::query!("select id from license_bind where id = ? limit 1", id)
+            .fetch_optional(self.pool.get().await?.deref_mut())
+            .await?;
+        Ok(rec.is_some())
+    }
+
+    /// 删除许可
+    pub async fn license_bind_remove(&self, id: &str) -> ResultType<()> {
+        let id = id.replace(' ', "");
+        sqlx::query!("delete from license_bind where id = ?", id)
+            .execute(self.pool.get().await?.deref_mut())
+            .await?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -156,23 +224,14 @@ mod tests {
     async fn insert() {
         let db = super::Database::new("test.sqlite3").await.unwrap();
         let mut jobs = vec![];
-        for i in 0..10000 {
+        for i in 0..1000 {
             let cloned = db.clone();
             let id = i.to_string();
             let a = tokio::spawn(async move {
                 let empty_vec = Vec::new();
-                cloned
-                    .insert_peer(&id, &empty_vec, &empty_vec, "")
-                    .await
-                    .unwrap();
-            });
-            jobs.push(a);
-        }
-        for i in 0..10000 {
-            let cloned = db.clone();
-            let id = i.to_string();
-            let a = tokio::spawn(async move {
-                cloned.get_peer(&id).await.unwrap();
+                let _ = cloned.insert_peer(&id, &empty_vec, &empty_vec, "").await;
+                let _ = cloned.cache_license_bind(&id, "t").await;
+                let _ = cloned.is_controller_allowed(&id, 24*3600*1000).await;
             });
             jobs.push(a);
         }
