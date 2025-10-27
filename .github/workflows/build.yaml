@@ -47,13 +47,16 @@ jobs:
       - name: Install toolchain
         uses: actions-rs/toolchain@v1
         with:
-          toolchain: "1.81"
+          toolchain: "1.85.0"
           override: true
           default: true
           components: rustfmt
           profile: minimal
           target: ${{ matrix.job.target }}
-
+		  
+      - name: Install cross (pinned)
+        run: cargo install cross --version 0.2.5 --locked
+	
       - name: Build
         uses: actions-rs/cargo@v1
         with:
@@ -88,7 +91,7 @@ jobs:
       - name: Install toolchain
         uses: actions-rs/toolchain@v1
         with:
-          toolchain: "1.81"
+          toolchain: "1.85.0"
           override: true
           default: true
           components: rustfmt
