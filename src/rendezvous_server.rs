@@ -689,7 +689,7 @@ impl RendezvousServer {
     /// 从连接地址反查出控制端(发起方) Peer ID
     async fn resolve_controller_id(&self, addr: SocketAddr) -> Option<String> {
         // 你的 PeerMap 里若有其他更直接的方法，可替换此处
-        if let Some(id) = self.pm.get_id_by_addr(addr).await {
+        if let Some(id) = self.pm.get_id_by_addr(&addr).await {
             return Some(id.replace(' ', ""));
         }
         None
