@@ -53,10 +53,8 @@ jobs:
           components: rustfmt
           profile: minimal
           target: ${{ matrix.job.target }}
-		  
       - name: Install cross (pinned)
         run: cargo install cross --version 0.2.5 --locked
-	
       - name: Build
         uses: actions-rs/cargo@v1
         with:
